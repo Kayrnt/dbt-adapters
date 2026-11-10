@@ -1,0 +1,6 @@
+kind: Fixes
+body: Back off 5s doubling up to 60s (jittered, within job_retry_deadline_seconds) before retrying a rateLimitExceeded error, such as a query job that hit too many concurrent ML.GENERATE_TEXT queries, instead of the 1-3s used for other retryable errors.
+time: 2026-11-09T16:00:00.000000+01:00
+custom:
+    Author: Kayrnt
+    Issue: "TBD"
