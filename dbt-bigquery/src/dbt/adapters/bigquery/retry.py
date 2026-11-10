@@ -1,3 +1,5 @@
+import random
+import time
 from typing import Any, Callable, Optional
 
 from google.api_core.exceptions import GoogleAPICallError, RetryError
@@ -24,6 +26,12 @@ _DEFAULT_POLLING_RETRY_DEADLINE = 10 * _MINUTE
 # just busy. We back these off without a jobs.get reload to avoid piling extra
 # API pressure onto a getQueryResults rate-limit storm.
 _RATE_LIMIT_REASONS = frozenset({"rateLimitExceeded", "jobRateLimitExceeded"})
+
+# A rate limit (e.g. too many concurrent ML.GENERATE_TEXT queries) is held by
+# other jobs for seconds to minutes, so a resubmit needs a longer backoff than
+# the 1-3s used for other retryable errors. Same cadence as the polling retry.
+_RATE_LIMIT_BACKOFF_INITIAL = 5.0
+_RATE_LIMIT_BACKOFF_MAXIMUM = 60.0
 
 
 def _is_rate_limit_error(error: Exception) -> bool:
@@ -74,7 +82,7 @@ class RetryFactory:
         )
 
         # there is no `with_on_error` method, but we want to retain the defaults on `DEFAULT_JOB_RETRY
-        retry._on_error = _create_reopen_on_error(connection)
+        retry._on_error = _create_reopen_on_error(connection, self._job_deadline)
 
         # don't override the default deadline to None if the user did not provide one,
         # the process will never end
@@ -197,9 +205,25 @@ class _TerminalJobAwarePredicate:
         return True
 
 
-def _create_reopen_on_error(connection: Connection) -> Callable[[Exception], None]:
+def _create_reopen_on_error(
+    connection: Connection, deadline: Optional[float] = None
+) -> Callable[[Exception], None]:
+    # api_core calls on_error before drawing its own sleep and checking the
+    # deadline, so a wait here delays the next attempt and counts toward it.
+    started_at = time.monotonic()
+    rate_limit_backoff = _RATE_LIMIT_BACKOFF_INITIAL
 
     def on_error(error: Exception):
+        nonlocal rate_limit_backoff
+        if _is_rate_limit_error(error):
+            # Jittered so threads throttled together don't resubmit together.
+            backoff = random.uniform(rate_limit_backoff / 2, rate_limit_backoff)
+            rate_limit_backoff = min(rate_limit_backoff * 2, _RATE_LIMIT_BACKOFF_MAXIMUM)
+            # Never wait past the deadline: the retry would then time out anyway.
+            if deadline is None or time.monotonic() - started_at + backoff < deadline:
+                _logger.debug(f"Rate limited, backing off {backoff:.1f}s: {repr(error)}")
+                time.sleep(backoff)
+
         if isinstance(error, (ConnectionResetError, ConnectionError)):
             _logger.warning("Reopening connection after {!r}".format(error))
             connection.handle.close()

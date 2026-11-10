@@ -557,6 +557,89 @@ class TestBigQueryConnectionManager(unittest.TestCase):
         self.assertNotEqual(job_ids_used[1], job_ids_used[0])
         self.mock_client.get_job.assert_not_called()
 
+    def _submit_dead_then_ok(self, error_result, job_ids_used):
+        """First job ends DONE with error_result, raised as BigQuery maps it; later jobs succeed."""
+        from google.cloud.bigquery.job.base import _error_result_to_exception
+
+        def submit(*args, **kwargs):
+            job_ids_used.append(kwargs.get("job_id"))
+            job = Mock(job_id=kwargs.get("job_id"), location="US", project="project")
+            job.state = "DONE"
+            if len(job_ids_used) == 1:
+                job.error_result = error_result
+                job.result.side_effect = _error_result_to_exception(error_result)
+            else:
+                job.error_result = None
+                job.result.return_value = iter([])
+            return job
+
+        return submit
+
+    def _rebuild_connections(self):
+        """RetryFactory reads credentials at init: rebuild after changing them."""
+        self.connections = BigQueryConnectionManager(
+            profile=Mock(credentials=self.credentials, query_comment=None),
+            mp_context=Mock(),
+        )
+        self.connections.get_thread_connection = lambda: self.mock_connection
+
+    @patch("dbt.adapters.bigquery.retry.time.sleep")
+    @patch("dbt.adapters.bigquery.connections.QueryJobConfig")
+    def test_raw_execute_resubmits_job_that_failed_with_rate_limit(
+        self, MockQueryJobConfig, mock_sleep
+    ):
+        """A job that BQ ends with rateLimitExceeded (e.g. too many concurrent
+        ML.GENERATE_TEXT queries) is resubmitted under a fresh job_id, after
+        a rate-limit backoff."""
+        self.credentials.job_retry_deadline_seconds = None
+        self._rebuild_connections()
+        rate_limited = {
+            "reason": "rateLimitExceeded",
+            "message": "Exceeded rate limits: too many concurrent queries that use "
+            "ML.GENERATE_TEXT table-valued function for this project.",
+        }
+        job_ids_used = []
+        self.mock_client.query.side_effect = self._submit_dead_then_ok(rate_limited, job_ids_used)
+
+        self.connections.raw_execute("SELECT * FROM ML.GENERATE_TEXT(...)")
+
+        self.assertEqual(len(job_ids_used), 2)
+        self.assertNotEqual(job_ids_used[1], job_ids_used[0])
+        self.assertTrue(any(2.5 <= c.args[0] <= 5.0 for c in mock_sleep.call_args_list))
+
+    @patch("dbt.adapters.bigquery.connections.QueryJobConfig")
+    def test_raw_execute_no_resubmit_of_rate_limited_job_when_retries_zero(
+        self, MockQueryJobConfig
+    ):
+        from dbt_common.exceptions import DbtDatabaseError
+
+        self.credentials.job_retries = 0
+        self._rebuild_connections()
+        job_ids_used = []
+        self.mock_client.query.side_effect = self._submit_dead_then_ok(
+            {"reason": "rateLimitExceeded", "message": "Exceeded rate limits"}, job_ids_used
+        )
+
+        with self.assertRaises(DbtDatabaseError):
+            self.connections.raw_execute("SELECT 1")
+        self.assertEqual(len(job_ids_used), 1)
+
+    @patch("dbt.adapters.bigquery.connections.QueryJobConfig")
+    def test_raw_execute_no_resubmit_of_job_that_failed_with_quota_exceeded(
+        self, MockQueryJobConfig
+    ):
+        """quotaExceeded (e.g. daily quota) won't clear on retry: fail without resubmitting."""
+        from dbt_common.exceptions import DbtDatabaseError
+
+        job_ids_used = []
+        self.mock_client.query.side_effect = self._submit_dead_then_ok(
+            {"reason": "quotaExceeded", "message": "Quota exceeded"}, job_ids_used
+        )
+
+        with self.assertRaises(DbtDatabaseError):
+            self.connections.raw_execute("SELECT 1")
+        self.assertEqual(len(job_ids_used), 1)
+
     @patch("dbt.adapters.bigquery.connections.QueryJobConfig")
     def test_raw_execute_no_retry_on_non_retryable_error(self, MockQueryJobConfig):
         exceptions = dbt.adapters.bigquery.impl.google.cloud.exceptions
@@ -1154,3 +1237,53 @@ class TestRetryFactoryPollingRetry(unittest.TestCase):
             maximum=60.0,
             multiplier=2.0,
         )
+
+
+@patch("dbt.adapters.bigquery.retry.time.sleep")
+class TestRateLimitBackoff(unittest.TestCase):
+    """on_error of create_reopen_with_deadline backs off longer on rate limits."""
+
+    rate_limited = google.cloud.exceptions.Forbidden(
+        "Exceeded rate limits", errors=[{"reason": "rateLimitExceeded"}]
+    )
+
+    def _on_error(self, deadline=None):
+        from dbt.adapters.bigquery.retry import _create_reopen_on_error
+
+        return _create_reopen_on_error(MagicMock(), deadline)
+
+    @patch("dbt.adapters.bigquery.retry.random.uniform", side_effect=lambda low, high: high)
+    def test_backoff_doubles_up_to_cap(self, _uniform, mock_sleep):
+        on_error = self._on_error()
+        for _ in range(6):
+            on_error(self.rate_limited)
+        self.assertEqual(
+            [c.args[0] for c in mock_sleep.call_args_list], [5.0, 10.0, 20.0, 40.0, 60.0, 60.0]
+        )
+
+    def test_backoff_is_jittered_within_bounds(self, mock_sleep):
+        self._on_error()(self.rate_limited)
+        self.assertTrue(2.5 <= mock_sleep.call_args.args[0] <= 5.0)
+
+    def test_no_backoff_for_other_errors(self, mock_sleep):
+        on_error = self._on_error()
+        on_error(
+            google.cloud.exceptions.InternalServerError(
+                "boom", errors=[{"reason": "backendError"}]
+            )
+        )
+        mock_sleep.assert_not_called()
+
+    def test_no_backoff_past_deadline(self, mock_sleep):
+        self._on_error(deadline=1)(self.rate_limited)
+        mock_sleep.assert_not_called()
+
+    @patch("dbt.adapters.bigquery.retry.random.uniform", side_effect=lambda low, high: high)
+    def test_backoff_within_deadline(self, _uniform, mock_sleep):
+        clock = [0.0]
+        mock_sleep.side_effect = lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+        with patch("dbt.adapters.bigquery.retry.time.monotonic", side_effect=lambda: clock[0]):
+            on_error = self._on_error(deadline=12)
+            on_error(self.rate_limited)  # 0s + 5s fits
+            on_error(self.rate_limited)  # 5s + 10s would end past 12s
+        self.assertEqual([c.args[0] for c in mock_sleep.call_args_list], [5.0])
